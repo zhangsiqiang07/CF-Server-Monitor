@@ -1,0 +1,91 @@
+name: Deploy CF Server Monitor Production
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'LICENSE'
+  workflow_run:
+    workflows: [Upstream Sync]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cf-server-monitor-production
+  cancel-in-progress: false
+
+env:
+  CLOUDFLARE_ACCOUNT_ID: 27d92ca44e3c94d159429ccf9a4482d6
+  WRANGLER_SEND_METRICS: 'false'
+
+jobs:
+  deploy:
+    if: >-
+      github.repository == 'zhangsiqiang07/CF-Server-Monitor' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Check deployment credential
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo '::error::请先在仓库 Actions Secrets 中配置 CF_DEPLOY_API_TOKEN。'
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build frontend
+        run: npm run build:frontend
+
+      - name: Configure existing production resources
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          let config = fs.readFileSync('wrangler.toml', 'utf8');
+          config = config.replace(/^name\s*=.*$/m, 'name = "cf-server-monitor"');
+          config = config.replace(/^account_id\s*=.*\n?/gm, '');
+          config = config.replace(/^keep_vars\s*=.*\n?/gm, '');
+          config = config.replace(/^workers_dev\s*=.*\n?/gm, '');
+          config = 'keep_vars = true\nworkers_dev = true\n' + config;
+          let dbFound = false;
+          config = config.replace(/\[\[d1_databases\]\]([\s\S]*?)(?=^\[|$(?![\s\S]))/gm, (section) => {
+            if (!/^binding\s*=\s*"DB"\s*$/m.test(section)) return section;
+            dbFound = true;
+            section = section.replace(/^database_id\s*=.*\n?/gm, '');
+            section = section.replace(/^database_name\s*=.*$/m, 'database_name = "server-monitor-db"');
+            return section.trimEnd() + '\ndatabase_id = "82263186-36b6-487f-aed5-9010b012ccea"\n\n';
+          });
+          if (!dbFound) throw new Error('找不到 DB 绑定，已停止部署，避免创建或使用其他数据库。');
+          fs.writeFileSync('wrangler.toml', config);
+          NODE
+
+      - name: Deploy existing Worker and preserve secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_DEPLOY_API_TOKEN }}
+        run: npx --no-install wrangler deploy --keep-vars
+
+      - name: Verify live site
+        run: |
+          curl --fail --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors --output /dev/null https://cf-server-monitor.zhangsiqiang07.workers.dev/
+          curl --fail --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors --output /dev/null https://cf-server-monitor.zhangsiqiang07.workers.dev/api/config
